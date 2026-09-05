@@ -321,20 +321,45 @@ enum NativeTiling {
         // minimum rather than stepped up to a whole fraction.
         let floorFraction = minColumnWidth > 0 ? min(1.0, minColumnWidth / region.width) : 0
 
-        // Compute each column's width in pixels
-        let colWidths: [CGFloat] = columns.map { col in
-            var fraction = max(col.widthOverride ?? effectiveDefaultWidth, floorFraction)
-            // Honour a window that will not shrink to its share. Mail and other apps
-            // with a fixed minimum width used to render wider than the column and lap
-            // over the next one, because our layout math is fit-to-screen. This is a
-            // scrolling strip, so the column takes the window's real width instead and
-            // the columns after it move along the strip and scroll, the way niri does.
-            // The width is measured, not asked for: see WindowManager.niriMinWidth.
+        // Compute each column's width in pixels.
+        //
+        // Honour a window that will not shrink to its share. Mail and other apps with a
+        // fixed minimum width used to render wider than the column and lap over the
+        // next one, because the shares are fit-to-screen. The column takes the window's
+        // real width instead. The width is measured, not asked for: see
+        // WindowManager.niriMinWidth. A column's own floor is the higher of the
+        // configured floor and what its windows have measured at.
+        let floorWidth = region.width * floorFraction
+        let shares: [CGFloat] = columns.map { col in
+            region.width * max(col.widthOverride ?? effectiveDefaultWidth, floorFraction)
+        }
+        let minWidths: [CGFloat] = columns.map { col in
             let widest = col.windows.compactMap { minWidthByWindow[$0] }.max() ?? 0
-            if widest > 0 {
-                fraction = max(fraction, (widest + gap) / region.width)
+            return widest > 0 ? max(floorWidth, widest + gap) : floorWidth
+        }
+        var colWidths: [CGFloat] = zip(shares, minWidths).map { max($0, $1) }
+
+        // A widened column takes its extra width from its neighbours before it takes it
+        // from the screen. Left as shares, two columns that fitted a laptop as halves
+        // stopped fitting the moment Mail measured wider than its half: Messages was
+        // parked and the strip showed one window at a time, which read as switching
+        // workspaces. So when columns that shared the screen overflow it only because of
+        // measured widths, the others give up the difference, in proportion to the room
+        // they have above their floor. A neighbour that cannot get that narrow measures
+        // wider on the next poll like any other window, and the pair then scrolls. A
+        // strip that was scrolling already is left alone: shrinking every column to fit
+        // the whole strip on screen is not what anyone asked for.
+        let sharesTotal = shares.reduce(0, +)
+        let deficit = colWidths.reduce(0, +) - region.width
+        if deficit > 0, sharesTotal <= region.width + 1 {
+            let room = zip(colWidths, minWidths).map { max($0 - $1, 0) }
+            let roomTotal = room.reduce(0, +)
+            if roomTotal > 0 {
+                let take = min(deficit, roomTotal)
+                for i in colWidths.indices {
+                    colWidths[i] -= take * room[i] / roomTotal
+                }
             }
-            return region.width * fraction
         }
 
         // Layout columns sequentially in the virtual strip
