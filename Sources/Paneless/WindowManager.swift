@@ -115,6 +115,10 @@ class WindowManager: WindowObserverDelegate {
     // again without it taking. See windowsPolled.
     private var reparkFailures: [CGWindowID: Int] = [:]
 
+    // Every window that has ever been tiled. Window ids are never reused within a
+    // login session, so this only grows by a few bytes per window and never lies.
+    private var onceTiled = Set<CGWindowID>()
+
     // The monitor whose active workspace is currently loaded into the live set
     // (trackedWindows / axElements / layoutEngine). Used to migrate state when a
     // display is disconnected so windows aren't stranded under a dead monitor ID.
@@ -974,8 +978,14 @@ class WindowManager: WindowObserverDelegate {
         // Everything after this point costs AX round trips to an app that may be slow,
         // measured at about 161ms, and until the window is out of sight the user is
         // watching it sit wherever the app happened to put it. That wait is the ghost.
+        // A window we have tiled before is tiled again, whatever it looks like now.
+        // Cmd+H, a native minimise or a spell in a fullscreen Space takes a window off
+        // the screen list and brings it back as new, and one returning from a half or
+        // third tile always looks like a small secondary window.
+        let tiledBefore = onceTiled.contains(windowID)
+
         // Auto-float dialogs and small windows
-        if !shouldFloat, config.autoFloatDialogs, let element = axElements[windowID] {
+        if !shouldFloat, !tiledBefore, config.autoFloatDialogs, let element = axElements[windowID] {
             if AccessibilityBridge.isDialog(element) || AccessibilityBridge.isSmallWindow(element) {
                 shouldFloat = true
                 panelessLog("Auto-floating dialog/small window: \(appName) (\(windowID))")
@@ -984,23 +994,16 @@ class WindowManager: WindowObserverDelegate {
 
         // Auto-float secondary windows from apps that already have a tiled window.
         // Catches: settings panels, popups, tab pickers, address bar suggestions, etc.
-        if !shouldFloat, let element = axElements[windowID] {
+        // Judged on size alone. This runs a few milliseconds after the window appears,
+        // before a terminal's shell has named it, so an empty title says nothing, and
+        // the popups this is for are small anyway.
+        if !shouldFloat, !tiledBefore, let element = axElements[windowID] {
             let appAlreadyTiled = layoutEngine.tiledWindows.contains { tid in
                 trackedWindows[tid]?.pid == pid
             }
-            if appAlreadyTiled {
-                let title = AccessibilityBridge.getTitle(of: element)
-                let isUntitled = title == nil || title?.isEmpty == true
-
-                // Check if the window is smaller than 70% of the tiling region
-                // (settings panels, preferences, etc. are typically smaller)
-                var isSmallerThanRegion = false
-                if let frame = AccessibilityBridge.getFrame(of: element) {
-                    let region = getTilingRegion()
-                    isSmallerThanRegion = frame.width < region.width * 0.7 || frame.height < region.height * 0.7
-                }
-
-                if isUntitled || isSmallerThanRegion {
+            if appAlreadyTiled, let frame = AccessibilityBridge.getFrame(of: element) {
+                let region = getTilingRegion()
+                if frame.width < region.width * 0.7 || frame.height < region.height * 0.7 {
                     shouldFloat = true
                     panelessLog("Auto-floating secondary window from \(appName) (\(windowID))")
                 }
@@ -1191,10 +1194,19 @@ class WindowManager: WindowObserverDelegate {
     }
 
     func windowDestroyed(windowID: CGWindowID) {
-        guard trackedWindows[windowID] != nil else { return }
+        guard trackedWindows[windowID] != nil else {
+            // Not on the live workspace. Hidden with Cmd+H, minimised or away on another
+            // native Space it still exists and keeps its place. Really gone, it must leave
+            // the workspace that lists it, or that workspace keeps a slot for a window
+            // that no longer exists.
+            guard SpaceManager.getWindowInfo(windowID) == nil else { return }
+            forgetParked(windowID)
+            return
+        }
 
         panelessLog("Window destroyed: \(windowID)")
         lastWindowDestroyedAt = Date()
+        if engineHolding(windowID) != nil { onceTiled.insert(windowID) }
 
         // Last known rect of the window that is going away, so focus can follow the
         // position rather than snapping to the top left.
@@ -1210,59 +1222,39 @@ class WindowManager: WindowObserverDelegate {
         let destroyedPid = trackedWindows[windowID]?.pid
 
         // Window swallowing: if this window swallowed a terminal, restore it
-        if let terminalWID = swallowedWindows.removeValue(forKey: windowID),
-           trackedWindows[terminalWID] != nil {
-            // Find the destroyed window's position in the layout
-            let owner = engineHolding(windowID) ?? layoutEngine
-            let destroyedIndex = owner.tiledWindows.firstIndex(of: windowID)
+        if let terminalWID = swallowedWindows.removeValue(forKey: windowID) {
+            if trackedWindows[terminalWID] != nil {
+                // Find the destroyed window's position in the layout
+                let owner = engineHolding(windowID) ?? layoutEngine
+                let destroyedIndex = owner.tiledWindows.firstIndex(of: windowID)
 
-            // Remove the GUI window from layout first
-            if config.niriMode {
-                owner.removeWindowFromColumns(windowID)
-            }
-            owner.remove(windowID: windowID)
-
-            // Clean up the destroyed window
-            trackedWindows.removeValue(forKey: windowID)
-            axElements.removeValue(forKey: windowID)
-            floatingWindows.remove(windowID)
-            fullscreenWindows.remove(windowID)
-            stickyWindows.remove(windowID)
-
-            // Restore the terminal window
-            trackedWindows[terminalWID]?.swallowedBy = nil
-
-            // Unhide the terminal
-            let conn = CGSMainConnectionID()
-            CGSSetWindowAlpha(conn, terminalWID, 1.0)
-
-            // Re-insert terminal into layout at the GUI window's old position
-            if let idx = destroyedIndex {
-                layoutEngine.tiledWindows.insert(terminalWID, at: min(idx, layoutEngine.tiledWindows.count))
-            } else {
-                layoutEngine.tiledWindows.append(terminalWID)
-            }
-
-            if config.niriMode {
-                layoutEngine.insertWindowAsNewColumn(terminalWID)
-                if let ci = layoutEngine.niriColumns.firstIndex(where: { $0.windows.contains(terminalWID) }) {
-                    layoutEngine.niriActiveColumn = ci
+                // Remove the GUI window from layout first
+                if config.niriMode {
+                    owner.removeWindowFromColumns(windowID)
                 }
+                owner.remove(windowID: windowID)
+
+                // Clean up the destroyed window
+                trackedWindows.removeValue(forKey: windowID)
+                axElements.removeValue(forKey: windowID)
+                floatingWindows.remove(windowID)
+                fullscreenWindows.remove(windowID)
+                stickyWindows.remove(windowID)
+
+                restoreSwallowedTerminal(terminalWID, at: destroyedIndex, in: owner)
+
+                retile()
+                panelessLog("Unswallowed terminal (\(terminalWID)), restored to layout")
+
+                let layouts = layoutEngine.calculateFrames(in: getTilingRegion())
+                updateBorders(layouts: layouts)
+                updateDimming(layouts: layouts)
+                return
             }
-
-            // Focus the restored terminal
-            if let element = axElements[terminalWID], let tracked = trackedWindows[terminalWID] {
-                AccessibilityBridge.focus(window: element, pid: tracked.pid)
-                focusedWindowID = terminalWID
-            }
-
-            retile()
-            panelessLog("Unswallowed terminal (\(terminalWID)), restored to layout")
-
-            let layouts = layoutEngine.calculateFrames(in: getTilingRegion())
-            updateBorders(layouts: layouts)
-            updateDimming(layouts: layouts)
-            return
+            // The terminal is parked on another workspace, so it gets its place back
+            // there, and this window closes here like any other.
+            WorkspaceManager.shared.releaseSwallowed(terminalWID)
+            panelessLog("Unswallowed terminal (\(terminalWID)) on its own workspace")
         }
 
         // If this window WAS a swallowed terminal (but the child outlived it), clean up
@@ -1350,6 +1342,45 @@ class WindowManager: WindowObserverDelegate {
             let layouts = layoutEngine.calculateFrames(in: getTilingRegion())
             updateBorders(layouts: layouts)
             updateDimming(layouts: layouts)
+        }
+    }
+
+    /// A window that closed while parked on another workspace.
+    private func forgetParked(_ windowID: CGWindowID) {
+        if let terminalWID = swallowedWindows.removeValue(forKey: windowID) {
+            WorkspaceManager.shared.releaseSwallowed(terminalWID)
+        }
+        WorkspaceManager.shared.forget(windowID)
+        panelessLog("Window \(windowID) closed while parked, dropped from its workspace")
+    }
+
+    /// Put a swallowed terminal back into a layout, where the window that swallowed it
+    /// used to be, and hand it focus.
+    private func restoreSwallowedTerminal(_ terminalWID: CGWindowID, at index: Int?, in engine: LayoutEngine) {
+        trackedWindows[terminalWID]?.swallowedBy = nil
+
+        // Unhide the terminal
+        let conn = CGSMainConnectionID()
+        CGSSetWindowAlpha(conn, terminalWID, 1.0)
+
+        // Re-insert terminal into layout at the GUI window's old position
+        if let idx = index {
+            engine.tiledWindows.insert(terminalWID, at: min(idx, engine.tiledWindows.count))
+        } else {
+            engine.tiledWindows.append(terminalWID)
+        }
+
+        if config.niriMode {
+            engine.insertWindowAsNewColumn(terminalWID)
+            if let ci = engine.niriColumns.firstIndex(where: { $0.windows.contains(terminalWID) }) {
+                engine.niriActiveColumn = ci
+            }
+        }
+
+        // Focus the restored terminal
+        if let element = axElements[terminalWID], let tracked = trackedWindows[terminalWID] {
+            AccessibilityBridge.focus(window: element, pid: tracked.pid)
+            focusedWindowID = terminalWID
         }
     }
 
@@ -1560,6 +1591,10 @@ class WindowManager: WindowObserverDelegate {
         for windowID in toRemove {
             windowDestroyed(windowID: windowID)
         }
+        // Its parked windows went with it.
+        for windowID in WorkspaceManager.shared.windows(ofPid: pid) {
+            forgetParked(windowID)
+        }
     }
 
     // MARK: - Cycle Layout
@@ -1614,7 +1649,15 @@ class WindowManager: WindowObserverDelegate {
             // Adjust active column's width override
             guard !layoutEngine.niriColumns.isEmpty else { return }
             let idx = max(0, min(layoutEngine.niriActiveColumn, layoutEngine.niriColumns.count - 1))
-            let current = layoutEngine.niriColumns[idx].widthOverride ?? config.niriColumnWidth
+            // Start from the width the column is actually drawn at. Seeding from the
+            // configured fraction ignored the fill-screen widening and the floor, so on a
+            // laptop the first grow made a column narrower and the first shrink dropped it
+            // by a few hundred points.
+            let drawn = NativeTiling.defaultColumnFraction(
+                columnCount: layoutEngine.niriColumns.count, region: getTilingRegion(),
+                configured: config.niriColumnWidth, minColumnWidth: config.niriMinColumnWidth,
+                fillScreen: config.niriFillScreen)
+            let current = layoutEngine.niriColumns[idx].widthOverride ?? drawn
             layoutEngine.niriColumns[idx].widthOverride = max(0.1, min(3.0, current + delta))
             panelessLog("Niri column \(idx) width: \(layoutEngine.niriColumns[idx].widthOverride!)")
             retile()
@@ -2861,7 +2904,20 @@ class WindowManager: WindowObserverDelegate {
 
         // Remove from current WM state
         let wasTiled = layoutEngine.contains(windowID)
+        let vacatedIndex = layoutEngine.tiledWindows.firstIndex(of: windowID)
+        // Out of the columns as well as the list. The retile would have dropped it
+        // from the columns anyway, but a terminal restored below re-syncs the list
+        // from the columns first, and would bring this window back with it.
+        if config.niriMode { layoutEngine.removeWindowFromColumns(windowID) }
         if wasTiled { layoutEngine.remove(windowID: windowID) }
+
+        // A window that swallowed a terminal leaves it behind, in the place it is
+        // giving up. Taken along, the terminal was stranded: the unswallow only knew
+        // how to find it on the workspace the window was on when it closed.
+        if let terminalWID = swallowedWindows.removeValue(forKey: windowID) {
+            trackedWindows[windowID]?.swallowedFrom = nil
+            restoreSwallowedTerminal(terminalWID, at: vacatedIndex, in: layoutEngine)
+        }
 
         let tracked = trackedWindows.removeValue(forKey: windowID)
         let element = axElements.removeValue(forKey: windowID)

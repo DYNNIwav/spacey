@@ -157,4 +157,50 @@ class WorkspaceManager {
         }
         return nil
     }
+
+    /// Drop a window from every stored workspace.
+    ///
+    /// For a window that closed while parked. The live set never saw it go, so its
+    /// workspace kept a slot for it: focus-follows-app could summon the ghost, and the
+    /// next switch there laid out around it and then jumped when the poll caught up.
+    func forget(_ windowID: CGWindowID) {
+        for (monitorID, monitorWorkspaces) in workspaces {
+            for (number, var ws) in monitorWorkspaces where ws.trackedWindows[windowID] != nil {
+                ws.trackedWindows.removeValue(forKey: windowID)
+                ws.axElements.removeValue(forKey: windowID)
+                ws.tiledWindows.removeAll { $0 == windowID }
+                ws.floatingWindows.remove(windowID)
+                ws.fullscreenWindows.remove(windowID)
+                for i in ws.niriColumns.indices {
+                    ws.niriColumns[i].windows.removeAll { $0 == windowID }
+                }
+                ws.niriColumns.removeAll { $0.windows.isEmpty }
+                ws.niriActiveColumn = max(0, min(ws.niriActiveColumn, ws.niriColumns.count - 1))
+                if ws.focusedWindowID == windowID { ws.focusedWindowID = nil }
+                workspaces[monitorID]?[number] = ws
+            }
+        }
+    }
+
+    /// Every parked window belonging to an app.
+    func windows(ofPid pid: pid_t) -> [CGWindowID] {
+        workspaces.values.flatMap { $0.values }.flatMap { ws in
+            ws.trackedWindows.filter { $0.value.pid == pid }.map { $0.key }
+        }
+    }
+
+    /// Give a parked terminal its place back once the window that swallowed it is gone.
+    /// It stays parked with its workspace and is laid out when that workspace is shown.
+    func releaseSwallowed(_ terminalWID: CGWindowID) {
+        for (monitorID, monitorWorkspaces) in workspaces {
+            for (number, var ws) in monitorWorkspaces where ws.trackedWindows[terminalWID] != nil {
+                ws.trackedWindows[terminalWID]?.swallowedBy = nil
+                if !ws.tiledWindows.contains(terminalWID) && !ws.floatingWindows.contains(terminalWID) {
+                    ws.tiledWindows.append(terminalWID)
+                }
+                workspaces[monitorID]?[number] = ws
+                return
+            }
+        }
+    }
 }

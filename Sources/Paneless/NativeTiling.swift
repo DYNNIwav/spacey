@@ -267,6 +267,34 @@ enum NativeTiling {
     /// along its longer side instead.
     static let minimumStackedPaneHeight: CGFloat = 400
 
+    /// The width a column is drawn at when it has no override of its own.
+    ///
+    /// Widen columns while they still fit. Two windows on a wide screen should share
+    /// it rather than sit at a third each with wallpaper between them, and the same
+    /// reasoning that gives a lone window the whole screen gives two windows a half.
+    /// Past the point where they fill the screen the configured width applies and the
+    /// strip starts to scroll.
+    ///
+    /// Then never leave a column too narrow to work in. The configured width is a
+    /// fraction, so one number means 1274 points on a wide display and 498 on a laptop,
+    /// and only one of those is a window anyone wants. Step up through whole fractions
+    /// until the column clears the floor, so a screen that cannot fit thirds falls back
+    /// to halves rather than to some number like 0.42. Nothing changes on a display wide
+    /// enough for the configured width.
+    static func defaultColumnFraction(columnCount: Int, region: TilingRegion,
+                                      configured: CGFloat, minColumnWidth: CGFloat,
+                                      fillScreen: Bool) -> CGFloat {
+        let fitWidth = 1.0 / CGFloat(max(columnCount, 1))
+        var fraction = fillScreen ? max(configured, min(fitWidth, 1.0)) : configured
+        if minColumnWidth > 0 {
+            for candidate in [1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0] as [CGFloat]
+            where region.width * fraction < minColumnWidth {
+                if candidate > fraction { fraction = candidate }
+            }
+        }
+        return fraction
+    }
+
     static func calculateNiriFrames(
         columns: [NiriColumn],
         region: TilingRegion,
@@ -284,32 +312,17 @@ enum NativeTiling {
         let halfGap = gap / 2
         let clampedActive = max(0, min(activeColumn, columns.count - 1))
 
-        // Widen columns while they still fit. Two windows on a wide screen should share
-        // it rather than sit at a third each with wallpaper between them, and the same
-        // reasoning that gives a lone window the whole screen gives two windows a half.
-        // Past the point where they fill the screen the configured width applies and the
-        // strip starts to scroll.
-        let fitWidth = 1.0 / CGFloat(max(columns.count, 1))
-        var effectiveDefaultWidth = fillScreen ? max(defaultColumnWidth, min(fitWidth, 1.0))
-                                               : defaultColumnWidth
+        let effectiveDefaultWidth = defaultColumnFraction(
+            columnCount: columns.count, region: region, configured: defaultColumnWidth,
+            minColumnWidth: minColumnWidth, fillScreen: fillScreen)
 
-        // Never leave a column too narrow to work in.
-        //
-        // The configured width is a fraction, so one number means 1274 points on a wide
-        // display and 498 on a laptop, and only one of those is a window anyone wants.
-        // Step up through whole fractions until the column clears the floor, so a screen
-        // that cannot fit thirds falls back to halves rather than to some number like
-        // 0.42. Nothing changes on a display wide enough for the configured width.
-        if minColumnWidth > 0 {
-            for candidate in [1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0] as [CGFloat]
-            where region.width * effectiveDefaultWidth < minColumnWidth {
-                if candidate > effectiveDefaultWidth { effectiveDefaultWidth = candidate }
-            }
-        }
+        // An override is the user's own number, so it is held to the floor as a plain
+        // minimum rather than stepped up to a whole fraction.
+        let floorFraction = minColumnWidth > 0 ? min(1.0, minColumnWidth / region.width) : 0
 
         // Compute each column's width in pixels
         let colWidths: [CGFloat] = columns.map { col in
-            let fraction = col.widthOverride ?? effectiveDefaultWidth
+            let fraction = max(col.widthOverride ?? effectiveDefaultWidth, floorFraction)
             return region.width * fraction
         }
 
