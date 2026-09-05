@@ -1,8 +1,13 @@
 import Cocoa
 
 protocol WindowObserverDelegate: AnyObject {
-    func windowCreated(windowID: CGWindowID, pid: pid_t, appName: String)
+    /// Returns false when the window could not be taken on yet and should be offered
+    /// again, which happens when its app has no accessibility element for it so far.
+    @discardableResult
+    func windowCreated(windowID: CGWindowID, pid: pid_t, appName: String) -> Bool
     func windowDestroyed(windowID: CGWindowID)
+    /// Every window on the current Space with its frame, as of the latest poll.
+    func windowsPolled(frames: [CGWindowID: CGRect])
     func spaceChanged()
     func focusChanged()
     func focusChanged(windowID: CGWindowID)
@@ -273,15 +278,36 @@ class WindowObserver {
 
     // MARK: - Polling
 
+    /// Windows the delegate has seen but could not take on yet: when first offered and
+    /// when last tried. A window whose app has not built its accessibility tree yet has
+    /// no element to move, and used to be written off after that one look. Keep offering
+    /// it for a while, a little apart, before giving up on it.
+    private var pendingAdoption: [CGWindowID: (firstSeen: Date, lastTry: Date)] = [:]
+    private let adoptionRetryFor: TimeInterval = 3.0
+    private let adoptionRetrySpacing: TimeInterval = 0.1
+
     private func pollWindows() {
         guard !isPaused else { return }
-        let currentWindows = Set(SpaceManager.getWindowsOnCurrentSpace())
+        let frames = SpaceManager.getWindowFramesOnCurrentSpace()
+        let currentWindows = Set(frames.keys)
+        let now = Date()
+        pendingAdoption = pendingAdoption.filter { currentWindows.contains($0.key) }
 
         let newWindows = currentWindows.subtracting(knownWindows)
         let conn = CGSMainConnectionID()
         for windowID in newWindows {
+            let pending = pendingAdoption[windowID]
+            if let pending = pending {
+                if now.timeIntervalSince(pending.lastTry) < adoptionRetrySpacing { continue }
+                if now.timeIntervalSince(pending.firstSeen) > adoptionRetryFor {
+                    // Give up: from here on it is just a window we know about.
+                    pendingAdoption.removeValue(forKey: windowID)
+                    continue
+                }
+            }
+
             // Pre-hide new windows before notifying delegate. The background
-            // interceptor may have already hidden this window — that's fine,
+            // interceptor may have already hidden this window, which is fine:
             // CGSSetWindowAlpha is idempotent.
             CGSSetWindowAlpha(conn, windowID, 0.0)
 
@@ -289,10 +315,16 @@ class WindowObserver {
             interceptorAcknowledge(windowID)
 
             if let info = SpaceManager.getWindowInfo(windowID) {
-                delegate?.windowCreated(windowID: windowID, pid: info.pid, appName: info.appName)
+                let adopted = delegate?.windowCreated(windowID: windowID, pid: info.pid, appName: info.appName) ?? true
                 markActivity()
+                if adopted {
+                    pendingAdoption.removeValue(forKey: windowID)
+                } else {
+                    pendingAdoption[windowID] = (pending?.firstSeen ?? now, now)
+                    CGSSetWindowAlpha(conn, windowID, 1.0)
+                }
             } else {
-                // Can't get info — restore alpha so window isn't stuck invisible
+                // Can't get info, so restore alpha rather than leave the window stuck invisible
                 CGSSetWindowAlpha(conn, windowID, 1.0)
             }
         }
@@ -303,7 +335,10 @@ class WindowObserver {
             markActivity()
         }
 
-        knownWindows = currentWindows
+        // A window still pending stays unknown, so the next poll offers it again.
+        knownWindows = currentWindows.subtracting(pendingAdoption.keys)
+
+        delegate?.windowsPolled(frames: frames)
     }
 
     // MARK: - AX Observers

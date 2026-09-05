@@ -156,6 +156,19 @@ class Animator: NSObject {
         var steps: [Glide] = []
         var pids = Set<pid_t>()
         for t in transitions {
+            var pid: pid_t = 0
+            AXUIElementGetPid(t.element, &pid)
+
+            // Already moving: send it somewhere else instead of starting it over. Even
+            // when it is passing through the new target this instant, or it would carry
+            // on to the old one.
+            if let live = inFlight[t.windowID] {
+                retarget(live, to: t.targetFrame, now: now)
+                steps.append(live)
+                pids.insert(pid)
+                continue
+            }
+
             let from = t.startFrame.width > 1 ? t.startFrame
                                               : (AccessibilityBridge.getFrame(of: t.element) ?? t.targetFrame)
             // Nothing to watch if it is already there.
@@ -163,16 +176,7 @@ class Animator: NSObject {
                 || abs(from.origin.y - t.targetFrame.origin.y) > 1
                 || abs(from.width - t.targetFrame.width) > 1
                 || abs(from.height - t.targetFrame.height) > 1 else { continue }
-            var pid: pid_t = 0
-            AXUIElementGetPid(t.element, &pid)
             pids.insert(pid)
-
-            // Already moving: send it somewhere else instead of starting it over.
-            if let live = inFlight[t.windowID] {
-                retarget(live, to: t.targetFrame, now: now)
-                steps.append(live)
-                continue
-            }
             // A new arrival leads and may swing past its mark; the others follow in a
             // short cascade, which reads as choreography rather than everything lurching
             // at once. Both are free: it only changes when each write is issued.
@@ -253,6 +257,9 @@ class Animator: NSObject {
     private var displayLink: CVDisplayLink?
     private let glideLock = NSLock()
     private var busyWindows = Set<CGWindowID>()
+    /// Bumped whenever the glides change hands, so a finishing tick queued for an
+    /// older animation is recognised and ignored.
+    private var glideGeneration = 0
     /// Concurrent so a slow app blocks only its own window, not the whole frame.
     /// Each app is a separate AX server, so these genuinely overlap.
     private let axQueue = DispatchQueue(label: "com.paneless.axglide", attributes: .concurrent)
@@ -352,9 +359,16 @@ class Animator: NSObject {
         glideLock.lock()
         let now = CACurrentMediaTime()
         for step in steps where step.startedAt == 0 { step.startedAt = now }
-        glides = steps
-        glideTargets = targets
-        busyWindows.removeAll()
+        // Only the windows named here change course. Anything else still in the air
+        // keeps going: the other screen's windows, or a column on its way out that the
+        // next scroll had no reason to mention. Replacing the whole set left those
+        // frozen wherever they happened to be.
+        let named = Set(steps.map { $0.windowID })
+        glides = glides.filter { !named.contains($0.windowID) } + steps
+        glideTargets = glideTargets.filter { old in
+            !targets.contains { CFEqual($0.element, old.element) }
+        } + targets
+        glideGeneration += 1
         glideLock.unlock()
 
         // A hung app must not be able to stall the loop for the multi-second AX default.
@@ -383,9 +397,15 @@ class Animator: NSObject {
             }
         }
 
-        // Off for the duration, so the apps don't animate against us.
-        restoreEnhancedUI = AccessibilityBridge.setEnhancedUI(pids: pids, enabled: false)
+        // Off for the duration, so the apps don't animate against us. Added to, not
+        // assigned: a takeover mid-glide finds the attribute already off and would
+        // otherwise forget who to hand it back to.
+        restoreEnhancedUI.formUnion(AccessibilityBridge.setEnhancedUI(pids: pids, enabled: false))
         isAnimating = true
+
+        // A link already running picks the new glides up on its next tick. Starting
+        // another per call leaked one running link for every key pressed mid-glide.
+        guard displayLink == nil else { return }
 
         var link: CVDisplayLink?
         guard CVDisplayLinkCreateWithActiveCGDisplays(&link) == kCVReturnSuccess, let link = link else {
@@ -463,6 +483,7 @@ class Animator: NSObject {
     private func glideTick() {
         glideLock.lock()
         let steps = glides
+        let generation = glideGeneration
         glideLock.unlock()
 
         guard !steps.isEmpty else { return }
@@ -471,7 +492,9 @@ class Animator: NSObject {
         // Every window keeps its own clock, so one can be sent somewhere new without
         // disturbing the timing of the others.
         if steps.allSatisfy({ now - $0.startedAt >= $0.duration + $0.delay }) {
-            DispatchQueue.main.async { [weak self] in self?.finishGlide(commit: true) }
+            DispatchQueue.main.async { [weak self] in
+                self?.finishGlide(commit: true, generation: generation)
+            }
             return
         }
 
@@ -516,7 +539,19 @@ class Animator: NSObject {
         }
     }
 
-    private func finishGlide(commit: Bool = false) {
+    /// `generation` is the animation a finishing tick was watching. The tick queues
+    /// this to the main thread, and by the time it runs a key press may have started a
+    /// new animation, or a workspace switch cancelled the old one. Committing the
+    /// targets of either would snap the fresh animation to its end, or put windows just
+    /// parked off-screen straight back at their old frames.
+    private func finishGlide(commit: Bool = false, generation: Int? = nil) {
+        glideLock.lock()
+        let stale = generation.map { $0 != glideGeneration } ?? false
+        if !stale { glideGeneration += 1 }
+        let finished = glides
+        glideLock.unlock()
+        if stale { return }
+
         if let link = displayLink {
             CVDisplayLinkStop(link)
             displayLink = nil
@@ -525,6 +560,11 @@ class Animator: NSObject {
         if commit && !targets.isEmpty {
             // Land exactly on the target, whatever the last interpolated frame was.
             AccessibilityBridge.batchSetFrames(targets)
+        }
+        // The tight timeout was for the animation. Left in place it capped every later
+        // call on these windows, including the one that parks them on a switch.
+        for g in finished {
+            AccessibilityBridge.limitMessagingTime(of: g.element, to: 0)
         }
         if !restoreEnhancedUI.isEmpty {
             AccessibilityBridge.setEnhancedUI(pids: restoreEnhancedUI, enabled: true)
@@ -637,6 +677,12 @@ class Animator: NSObject {
         // its own targets, and committing here would fight them.
         if displayLink != nil || !glides.isEmpty {
             finishGlide()
+        } else {
+            // Nothing to stop, but a finishing tick may still be queued for the last
+            // animation. Make sure it finds itself out of date.
+            glideLock.lock()
+            glideGeneration += 1
+            glideLock.unlock()
         }
         isAnimating = false
     }

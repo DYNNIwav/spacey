@@ -28,12 +28,14 @@ class WindowManager: WindowObserverDelegate {
         return created
     }
 
+    /// The screen a workspace or layout is keyed to, if it is still connected.
+    func screen(for monitorID: String) -> NSScreen? {
+        NSScreen.screens.first { WorkspaceManager.shared.screenID(for: $0) == monitorID }
+    }
+
     /// The tiling region belonging to a layout's own screen.
     func region(for engine: LayoutEngine) -> TilingRegion {
-        let screen = NSScreen.screens.first {
-            WorkspaceManager.shared.screenID(for: $0) == engine.monitorID
-        }
-        return getTilingRegion(for: screen)
+        return getTilingRegion(for: screen(for: engine.monitorID))
     }
 
     /// The layout for the screen a window is physically sitting on.
@@ -108,6 +110,10 @@ class WindowManager: WindowObserverDelegate {
 
     // Focus-follows-app: guard against re-entrant workspace switches
     private var isAutoSwitching = false
+
+    // How many times in a row a parked window has been found on screen and parked
+    // again without it taking. See windowsPolled.
+    private var reparkFailures: [CGWindowID: Int] = [:]
 
     // The monitor whose active workspace is currently loaded into the live set
     // (trackedWindows / axElements / layoutEngine). Used to migrate state when a
@@ -924,21 +930,21 @@ class WindowManager: WindowObserverDelegate {
         CGSSetWindowAlpha(conn, windowID, 1.0)
     }
 
-    func windowCreated(windowID: CGWindowID, pid: pid_t, appName: String) {
+    func windowCreated(windowID: CGWindowID, pid: pid_t, appName: String) -> Bool {
         panelessLog("New window \(windowID) (\(appName)) seen by Paneless")
         guard trackedWindows[windowID] == nil else {
             restoreWindowAlpha(windowID)
-            return
+            return true
         }
         // Skip windows hidden on other virtual workspaces
         guard !WorkspaceManager.shared.isWindowHiddenOnOtherWorkspace(windowID) else {
             restoreWindowAlpha(windowID)
-            return
+            return true
         }
         let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
         guard !appMatchesRule(appName, bundleID: bundleID, rules: config.excludeApps) else {
             restoreWindowAlpha(windowID)
-            return
+            return true
         }
 
         var shouldFloat = appMatchesRule(appName, bundleID: bundleID, rules: config.floatApps)
@@ -952,7 +958,17 @@ class WindowManager: WindowObserverDelegate {
         )
         trackedWindows[windowID] = tracked
 
-        axElements[windowID] = AccessibilityBridge.windowElement(for: windowID, pid: pid)
+        // No element means no way to move the window, so nothing below can work. Say so
+        // rather than writing the window off: an app that has just launched often has no
+        // accessibility tree yet at the instant its window appears, and Preview opened
+        // from a Mail attachment sat unmanaged for exactly that reason. The observer
+        // offers the window again shortly.
+        guard let element = AccessibilityBridge.windowElement(for: windowID, pid: pid) else {
+            trackedWindows.removeValue(forKey: windowID)
+            restoreWindowAlpha(windowID)
+            return false
+        }
+        axElements[windowID] = element
 
         // Park it the moment we can address it, before any of the classification below.
         // Everything after this point costs AX round trips to an app that may be slow,
@@ -1033,7 +1049,7 @@ class WindowManager: WindowObserverDelegate {
                 observer.syncKnownWindows(known)
 
                 panelessLog("Auto-moved \(appName) (\(windowID)) to workspace \(target)")
-                return
+                return true
             }
         }
 
@@ -1082,13 +1098,13 @@ class WindowManager: WindowObserverDelegate {
             retileWithScaleIn(newWindowID: windowID)
 
             panelessLog("Swallowed \(trackedWindows[terminalWID]?.appName ?? "terminal") (\(terminalWID)) → \(appName) (\(windowID))")
-            return
+            return true
         }
 
         if shouldFloat {
             floatingWindows.insert(windowID)
             restoreWindowAlpha(windowID)
-        } else if axElements[windowID] != nil {
+        } else {
             // The window joins the layout of the display it opened on. It used to join
             // whichever display had the keyboard, so a window appearing on the second
             // screen was tiled into the first one's row and dragged across to reach it.
@@ -1129,9 +1145,40 @@ class WindowManager: WindowObserverDelegate {
             CGSSetWindowAlpha(conn, windowID, 0.0)
 
             retileWithScaleIn(newWindowID: windowID)
-        } else {
-            trackedWindows.removeValue(forKey: windowID)
-            restoreWindowAlpha(windowID)
+        }
+        return true
+    }
+
+    /// Put back any parked window that has strayed onto the screen.
+    ///
+    /// A park is one write into another process with no read-back. The app may be busy
+    /// and time out, it may move its own window later, and macOS relocates anything it
+    /// considers off-screen after a display change. None of that was noticed, and the
+    /// window then sat in plain view behind whatever was raised last, on a workspace it
+    /// did not belong to. The poll already has every window's frame, so check the parked
+    /// ones against it and park again as needed. Three failures in a row means the app
+    /// will not take the position; stop asking rather than write to it forever.
+    func windowsPolled(frames: [CGWindowID: CGRect]) {
+        let wsMgr = WorkspaceManager.shared
+        for (monitorID, monitorWorkspaces) in wsMgr.workspaces {
+            let active = wsMgr.activeWorkspace[monitorID] ?? 1
+            guard let screen = screen(for: monitorID) else { continue }
+            let screenFrame = screenFrameInAX(for: screen)
+            for (number, ws) in monitorWorkspaces where number != active {
+                for (wid, element) in ws.axElements {
+                    guard !stickyWindows.contains(wid), let frame = frames[wid] else { continue }
+                    if wsMgr.isHiddenPosition(screenFrame: screenFrame, windowFrame: frame) {
+                        reparkFailures.removeValue(forKey: wid)
+                        continue
+                    }
+                    let failures = reparkFailures[wid, default: 0]
+                    guard failures < 3 else { continue }
+                    reparkFailures[wid] = failures + 1
+                    wsMgr.hideWindow(wid, element: element, screenFrame: screenFrame)
+                    let name = ws.trackedWindows[wid]?.appName ?? "?"
+                    panelessLog("Window \(wid) (\(name)) had strayed from workspace \(number)'s parking corner, parked it again")
+                }
+            }
         }
     }
 
@@ -2696,6 +2743,15 @@ class WindowManager: WindowObserverDelegate {
         observer.pause()
         defer { observer.resume() }
 
+        // Whatever is still in the air belongs to the workspace being left. Left
+        // running, its final write put those windows back at their tile frames on top
+        // of the new workspace, which is how a window came to sit behind the one you
+        // had switched to. The delayed niri park is the same kind of leftover.
+        Animator.shared.cancelAll()
+        niriHideWorkItem?.cancel()
+        niriHideWorkItem = nil
+        reparkFailures.removeAll()
+
         let screenFrame = screenFrameInAX(for: screen)
 
         // Remove dim overlays before switching (they reference old workspace windows)
@@ -2817,7 +2873,9 @@ class WindowManager: WindowObserverDelegate {
             CGSSetWindowListBrightness(CGSMainConnectionID(), &wids, &values, 1)
         }
 
-        // Hide the window (move off-screen)
+        // Hide the window (move off-screen). Stop any glide it is in first, or the
+        // glide's final write brings it straight back.
+        Animator.shared.cancelAll()
         let screenFrame = screenFrameInAX(for: screen)
         WorkspaceManager.shared.hideWindow(windowID, element: element, screenFrame: screenFrame)
 

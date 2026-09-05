@@ -57,12 +57,24 @@ enum SpaceManager {
 
     // MARK: - Window Enumeration
 
+    /// Ordinary windows on the current Space, front to back, as the window server lists them.
     static func getWindowsOnCurrentSpace() -> [CGWindowID] {
+        return onScreenWindows().map { $0.windowID }
+    }
+
+    /// The same windows with their frames, in the same coordinates the AX API uses.
+    static func getWindowFramesOnCurrentSpace() -> [CGWindowID: CGRect] {
+        var frames: [CGWindowID: CGRect] = [:]
+        for window in onScreenWindows() { frames[window.windowID] = window.frame }
+        return frames
+    }
+
+    private static func onScreenWindows() -> [(windowID: CGWindowID, frame: CGRect)] {
         guard let windowList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
         else { return [] }
 
-        var windows: [CGWindowID] = []
+        var windows: [(windowID: CGWindowID, frame: CGRect)] = []
         let myPID = ProcessInfo.processInfo.processIdentifier
 
         for info in windowList {
@@ -76,7 +88,8 @@ enum SpaceManager {
 
             if ownerPID == myPID { continue }
 
-            windows.append(windowID)
+            let frame = CGRect(x: bounds["X"] ?? 0, y: bounds["Y"] ?? 0, width: width, height: height)
+            windows.append((windowID, frame))
         }
 
         return windows

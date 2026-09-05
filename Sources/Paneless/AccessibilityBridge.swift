@@ -132,7 +132,8 @@ enum AccessibilityBridge {
     /// Cap how long an AX call on this element may block. The system default is several
     /// seconds, so one hung app can otherwise wedge an animation loop for that long.
     /// Generous next to the slowest resize measured here (Safari, 51.75ms) and far below
-    /// the default.
+    /// the default. The cap sticks to the element for every later call, so pass 0 to
+    /// restore the default once the animation is over.
     static func limitMessagingTime(of element: AXUIElement, to seconds: Float = 0.25) {
         AXUIElementSetMessagingTimeout(element, seconds)
     }
