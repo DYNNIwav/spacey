@@ -30,7 +30,9 @@ class Animator: NSObject {
     /// Lets the owner run the ProMotion keepalive only while it is worth anything.
     var onAnimationActive: ((Bool) -> Void)?
 
-    private var isAnimating = false
+    /// True while a glide or app-driven animation is in flight. Read by the poll so it
+    /// does not measure a window's width mid-move.
+    var isAnimating = false
     private let conn = CGSMainConnectionID()
 
     // Close animation state

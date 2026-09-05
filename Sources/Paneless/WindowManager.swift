@@ -119,6 +119,11 @@ class WindowManager: WindowObserverDelegate {
     // login session, so this only grows by a few bytes per window and never lies.
     private var onceTiled = Set<CGWindowID>()
 
+    // A niri window's measured minimum width, for windows that refuse to be as narrow
+    // as their column. Filled in by the poll, read by the niri layout so the column
+    // widens to fit rather than letting the window overlap the next one.
+    private var niriMinWidth: [CGWindowID: CGFloat] = [:]
+
     // The monitor whose active workspace is currently loaded into the live set
     // (trackedWindows / axElements / layoutEngine). Used to migrate state when a
     // display is disconnected so windows aren't stranded under a dead monitor ID.
@@ -181,11 +186,19 @@ class WindowManager: WindowObserverDelegate {
         let monitorID = WorkspaceManager.shared.screenID(for: screen)
         WorkspaceManager.shared.activeWorkspace[monitorID] = 1
         liveMonitorID = monitorID
+
+        // Spread windows back to their saved workspaces BEFORE the first save, not after.
+        //
+        // The first save is not debounced away, because the last-save time starts at the
+        // distant past, so it writes at once. Doing it first overwrote the saved file with
+        // everything piled on workspace 1, and restore then read that clobbered file and
+        // found nothing to move: every window stayed on workspace 1, most of them parked
+        // off the edge of the strip where they looked lost. Restore first, save the
+        // result.
+        WorkspacePersistence.restoreWorkspaceAssignments()
+
         saveWorkspaceState(workspace: 1, monitor: monitorID)
         panelessLog("Initialized workspace 1 on \(monitorID) with \(layoutEngine.tiledWindows.count) tiled windows")
-
-        // Restore windows to their saved workspaces from a previous session
-        WorkspacePersistence.restoreWorkspaceAssignments()
 
         // Smart retile on display change (monitor connected/disconnected/resolution change)
         NotificationCenter.default.addObserver(
@@ -1183,6 +1196,49 @@ class WindowManager: WindowObserverDelegate {
                 }
             }
         }
+
+        measureNiriMinWidths(frames: frames)
+    }
+
+    /// Learn which niri windows refuse to be as narrow as their column, so the column
+    /// can widen to fit them. macOS does not report a window's minimum width, so it is
+    /// measured: lay the strip out, then see which windows came back wider than the share
+    /// we gave them. Skip while an animation or a divider drag is in flight, when a width
+    /// read would be mid-move.
+    ///
+    /// Only ever grows the recorded width, and records the window's own rendered width,
+    /// which the window then accepts unchanged, so it settles after one retile. A clear
+    /// or shrink path here would fight a terminal that rounds its width down to a
+    /// character cell: give it back the space, it snaps narrow again, and the column
+    /// jitters on every poll. A window that no longer needs the width just keeps a
+    /// slightly wide column until it closes, which nobody notices.
+    private func measureNiriMinWidths(frames: [CGWindowID: CGRect]) {
+        guard config.niriMode, !Animator.shared.isAnimating, !isResizing,
+              !layoutEngine.niriColumns.isEmpty else { return }
+
+        let region = getTilingRegion()
+        var offset = layoutEngine.niriScrollOffset
+        let allocated = NativeTiling.calculateNiriFrames(
+            columns: layoutEngine.niriColumns, region: region, gap: config.innerGap,
+            activeColumn: layoutEngine.niriActiveColumn,
+            defaultColumnWidth: config.niriColumnWidth,
+            minColumnWidth: config.niriMinColumnWidth, stackMode: config.niriColumnStack,
+            scrollOffset: layoutEngine.niriScrollOffset, fillScreen: config.niriFillScreen,
+            minWidthByWindow: niriMinWidth, resultingScrollOffset: &offset)
+
+        let tolerance: CGFloat = 4
+        var changed = false
+        for colResult in allocated where colResult.isVisible {
+            for (wid, allocFrame) in colResult.windowFrames {
+                guard let actual = frames[wid] else { continue }
+                if actual.width > allocFrame.width + tolerance,
+                   (niriMinWidth[wid] ?? 0) < actual.width - tolerance {
+                    niriMinWidth[wid] = actual.width
+                    changed = true
+                }
+            }
+        }
+        if changed { retile() }
     }
 
     /// An AX element somewhere died. If it is one of the windows we track, tear it
@@ -1268,6 +1324,7 @@ class WindowManager: WindowObserverDelegate {
         floatingWindows.remove(windowID)
         fullscreenWindows.remove(windowID)
         stickyWindows.remove(windowID)
+        niriMinWidth.removeValue(forKey: windowID)
         if dimmedWindows.remove(windowID) != nil {
             var wids: [CGWindowID] = [windowID]
             var values: [Float] = [0.0]
@@ -1350,6 +1407,7 @@ class WindowManager: WindowObserverDelegate {
         if let terminalWID = swallowedWindows.removeValue(forKey: windowID) {
             WorkspaceManager.shared.releaseSwallowed(terminalWID)
         }
+        niriMinWidth.removeValue(forKey: windowID)
         WorkspaceManager.shared.forget(windowID)
         panelessLog("Window \(windowID) closed while parked, dropped from its workspace")
     }
@@ -1732,6 +1790,7 @@ class WindowManager: WindowObserverDelegate {
             stackMode: config.niriColumnStack,
             scrollOffset: engine.niriScrollOffset,
             fillScreen: config.niriFillScreen,
+            minWidthByWindow: niriMinWidth,
             resultingScrollOffset: &engine.niriScrollOffset
         )
 
@@ -1802,6 +1861,7 @@ class WindowManager: WindowObserverDelegate {
             stackMode: config.niriColumnStack,
             scrollOffset: layoutEngine.niriScrollOffset,
             fillScreen: config.niriFillScreen,
+            minWidthByWindow: niriMinWidth,
             resultingScrollOffset: &layoutEngine.niriScrollOffset
         )
 
@@ -1922,6 +1982,7 @@ class WindowManager: WindowObserverDelegate {
             stackMode: config.niriColumnStack,
             scrollOffset: layoutEngine.niriScrollOffset,
             fillScreen: config.niriFillScreen,
+            minWidthByWindow: niriMinWidth,
             resultingScrollOffset: &layoutEngine.niriScrollOffset
         )
 

@@ -305,6 +305,7 @@ enum NativeTiling {
         stackMode: String = "auto",
         scrollOffset: CGFloat = 0,
         fillScreen: Bool = false,
+        minWidthByWindow: [CGWindowID: CGFloat] = [:],
         resultingScrollOffset: inout CGFloat
     ) -> [NiriColumnResult] {
         guard !columns.isEmpty else { return [] }
@@ -322,7 +323,17 @@ enum NativeTiling {
 
         // Compute each column's width in pixels
         let colWidths: [CGFloat] = columns.map { col in
-            let fraction = max(col.widthOverride ?? effectiveDefaultWidth, floorFraction)
+            var fraction = max(col.widthOverride ?? effectiveDefaultWidth, floorFraction)
+            // Honour a window that will not shrink to its share. Mail and other apps
+            // with a fixed minimum width used to render wider than the column and lap
+            // over the next one, because our layout math is fit-to-screen. This is a
+            // scrolling strip, so the column takes the window's real width instead and
+            // the columns after it move along the strip and scroll, the way niri does.
+            // The width is measured, not asked for: see WindowManager.niriMinWidth.
+            let widest = col.windows.compactMap { minWidthByWindow[$0] }.max() ?? 0
+            if widest > 0 {
+                fraction = max(fraction, (widest + gap) / region.width)
+            }
             return region.width * fraction
         }
 
