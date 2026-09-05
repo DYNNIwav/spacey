@@ -1235,6 +1235,8 @@ class WindowManager: WindowObserverDelegate {
                    (niriMinWidth[wid] ?? 0) < actual.width - tolerance {
                     niriMinWidth[wid] = actual.width
                     changed = true
+                    let name = trackedWindows[wid]?.appName ?? "?"
+                    panelessLog("Window \(wid) (\(name)) rendered \(Int(actual.width)) wide in a \(Int(allocFrame.width)) column, widening the column to fit")
                 }
             }
         }
